@@ -1,11 +1,11 @@
 # pi-mcp-bridge
 
-Expose selected MCP servers from Codex's `~/.codex/config.toml` as native [Pi](https://github.com/badlogic/pi-mono) tools.
+Expose [Exa](https://github.com/exa-labs/exa-mcp-server) and [Morph](https://docs.morphllm.com/mcpquickstart) servers from Codex's [MCP configuration](https://developers.openai.com/codex/mcp/) as native [Pi](https://github.com/badlogic/pi-mono) tools. The bridge uses the official [MCP TypeScript client](https://github.com/modelcontextprotocol/typescript-sdk) v2.
 
 ## Install
 
 ```sh
-pi install git:github.com/L0stInFades/pi-mcp-bridge@v0.1.0
+pi install git:github.com/L0stInFades/pi-mcp-bridge@v0.2.0
 ```
 
 Start Pi and check the connection:
@@ -14,27 +14,42 @@ Start Pi and check the connection:
 /mcp-status
 ```
 
-The bridge reads your existing Codex MCP configuration; it does not copy credentials anywhere.
+The bridge reads the same Codex MCP configuration on macOS, Linux, and Windows; Pi needs no second copy of either API key.
 
-## Supported configuration
+## Configure Exa and Morph
 
-The default servers are `exa` and `morph-mcp`. Both common Codex transport forms are supported:
+The shortest cross-platform setup is to add this to `~/.codex/config.toml` (`$HOME\.codex\config.toml` in PowerShell):
 
 ```toml
-[mcp_servers.example]
+[mcp_servers.exa]
+url = "https://mcp.exa.ai/mcp"
+http_headers = { "x-api-key" = "YOUR_EXA_API_KEY" }
+
+[mcp_servers.morph-mcp]
 command = "npx"
-args = ["-y", "your-mcp-package"]
-
-[mcp_servers.example.env]
-API_KEY = "your-key"
+args = ["-y", "@morphllm/morphmcp"]
+env = { MORPH_API_KEY = "YOUR_MORPH_API_KEY" }
+startup_timeout_sec = 120
 ```
+
+Exa also works anonymously with lower limits. To keep keys out of the file, set `EXA_API_KEY` and `MORPH_API_KEY` in the environment and use:
 
 ```toml
-[mcp_servers.example]
-url = "https://example.com/mcp"
+[mcp_servers.exa]
+url = "https://mcp.exa.ai/mcp"
+env_http_headers = { "x-api-key" = "EXA_API_KEY" }
+
+[mcp_servers.morph-mcp]
+command = "npx"
+args = ["-y", "@morphllm/morphmcp"]
+env_vars = ["MORPH_API_KEY"]
 ```
 
-Select other configured servers with `PI_MCP_SERVERS`:
+PowerShell can persist those variables with `setx EXA_API_KEY "..."` and `setx MORPH_API_KEY "..."`; open a new terminal afterward.
+
+The bridge supports Codex's stdio fields (`command`, `args`, `env`, `env_vars`, `cwd`), HTTP credential fields (`http_headers`, `env_http_headers`, `bearer_token_env_var`), tool filters, and startup/tool timeouts. Codex-managed OAuth sessions are not copied into Pi.
+
+The default servers are `exa` and `morph-mcp`. Select other configured servers with `PI_MCP_SERVERS`:
 
 ```sh
 PI_MCP_SERVERS=example,another pi
@@ -51,10 +66,13 @@ Set `PI_MCP_CONFIG_PATH` to use a config file other than `~/.codex/config.toml`.
 ## Behavior
 
 - Discovers and registers every tool exposed by the selected servers.
-- Supports stdio, Streamable HTTP, and SSE fallback.
+- Speaks MCP `2026-07-28` and automatically falls back to current `2025` servers.
+- Supports stdio and standard Streamable HTTP transports.
+- Honors Codex tool allow/deny lists and timeout settings.
 - Reconnects a stopped server on the next tool call.
 - Truncates oversized output and saves the full response in the system temp directory.
-- Serializes concurrent Morph `edit_file` calls targeting the same path.
+- Passes MCP images through as native Pi image content.
+- Uses MCP destructive annotations to make Pi execute write tools sequentially.
 - Redacts API keys, bearer tokens, and URL query values from surfaced errors.
 
 Morph's local server receives Pi's current working directory, and `codebase_search.repo_path` defaults to it.

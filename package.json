@@ -1,7 +1,7 @@
 {
   "name": "@l0stinfades/pi-mcp-bridge",
-  "version": "0.1.0",
-  "description": "Bridge selected Codex MCP servers into Pi as native tools.",
+  "version": "0.2.0",
+  "description": "Bridge Codex-configured Exa and Morph MCP servers into Pi as native tools.",
   "type": "module",
   "main": "./src/index.js",
   "files": [
@@ -32,9 +32,11 @@
     "node": ">=20.6.0"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "smol-toml": "^1.8.0",
-    "zod": "^4.4.3"
+    "@modelcontextprotocol/client": "^2.0.0",
+    "smol-toml": "^1.8.0"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0"
   },
   "pi": {
     "extensions": [

@@ -13,13 +13,13 @@ test("bridges a configured stdio MCP tool into Pi", async (t) => {
   const fixturePath = join(projectDir, "test", "fixture-server.mjs");
   await writeFile(
     configPath,
-    `[mcp_servers.exa]\ncommand = ${JSON.stringify(process.execPath)}\nargs = [${JSON.stringify(fixturePath)}]\n`,
+    `[mcp_servers.exa]\ncommand = ${JSON.stringify(process.execPath)}\nargs = [${JSON.stringify(fixturePath)}]\nenabled_tools = ["echo"]\n`,
   );
 
   const previousConfig = process.env.PI_MCP_CONFIG_PATH;
   const previousServers = process.env.PI_MCP_SERVERS;
   process.env.PI_MCP_CONFIG_PATH = configPath;
-  process.env.PI_MCP_SERVERS = "exa";
+  process.env.PI_MCP_SERVERS = "exa,morph-mcp";
 
   let shutdown;
   t.after(async () => {
@@ -60,10 +60,14 @@ test("bridges a configured stdio MCP tool into Pi", async (t) => {
 
   assert(commands.has("mcp-status"));
   assert(commands.has("mcp-reconnect"));
+  assert.equal(tools.size, 1);
   const echo = tools.get("mcp__exa__echo");
   assert(echo);
+  assert.equal(tools.has("mcp__exa__hidden"), false);
+  assert.match(echo.promptSnippet, /^exa\/echo/);
   assert.equal(echo.parameters.type, "object");
 
   const result = await echo.execute("test-call", { text: "hello" }, new AbortController().signal, undefined, ctx);
   assert.equal(result.content[0].text, "hello");
+  assert.equal(result.details.protocol, "2025-11-25");
 });

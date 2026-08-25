@@ -1,7 +1,5 @@
-import { Client } from "@modelcontextprotocol/sdk/client";
-import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -13,54 +11,9 @@ const CONFIG_PATH = process.env.PI_MCP_CONFIG_PATH || join(homedir(), ".codex", 
 const TARGET_SERVERS = [...new Set((process.env.PI_MCP_SERVERS || "exa,morph-mcp").split(",").map((name) => name.trim()).filter(Boolean))];
 const DEFAULT_MAX_BYTES = 50 * 1024;
 const DEFAULT_MAX_LINES = 2000;
-const CLIENT_INFO = { name: "pi-mcp-bridge", version: "0.1.0" };
-const TOOL_METADATA = {
-  mcp__exa__web_search_exa: {
-    promptSnippet: "Use Exa for current external web research.",
-    promptGuidelines: [
-      "Use this for current web facts, company research, and non-local external research.",
-      "Prefer primary or official sources when possible.",
-    ],
-  },
-  mcp__exa__crawling_exa: {
-    promptSnippet: "Fetch and read one or more external URLs with Exa.",
-    promptGuidelines: [
-      "Use this after identifying relevant URLs that need to be read in detail.",
-      "Batch multiple URLs into one call when practical.",
-    ],
-  },
-  mcp__exa__get_code_context_exa: {
-    promptSnippet: "Use Exa for external programming docs, SDK usage, and code examples.",
-    promptGuidelines: [
-      "Use this for libraries, APIs, SDKs, and official docs beyond the local repository.",
-      "Prefer this over generic web search when the question is about programming usage or documentation.",
-    ],
-  },
-  mcp__morph_mcp__codebase_search: {
-    promptSnippet: "Use Morph semantic search for broad local codebase discovery.",
-    promptGuidelines: [
-      "Use this for broad local discovery like 'find the flow', 'where is this handled?', or 'where does this error come from?'.",
-      "Prefer exact lookup tools for literal strings and symbol names once you know them.",
-    ],
-  },
-  mcp__morph_mcp__github_codebase_search: {
-    promptSnippet: "Use Morph semantic search for public GitHub repositories not cloned locally.",
-    promptGuidelines: [
-      "Use this when the target code lives in a public GitHub repository that is not cloned locally.",
-    ],
-  },
-  mcp__morph_mcp__edit_file: {
-    promptSnippet: "Use Morph for routine partial-file edits when the target change is already understood.",
-    promptGuidelines: [
-      "Prefer this for focused partial-file edits with minimal context.",
-      "If this tool fails to apply a change cleanly, fall back to pi's local edit and write tools.",
-    ],
-  },
-};
+const CLIENT_INFO = { name: "pi-mcp-bridge", version: "0.2.0" };
 
 const serverStates = new Map();
-const registeredTools = new Set();
-const fileMutationQueues = new Map();
 
 function formatSize(bytes) {
   if (bytes < 1024) return `${bytes}B`;
@@ -97,19 +50,6 @@ function truncateHead(content, { maxBytes = DEFAULT_MAX_BYTES, maxLines = DEFAUL
   };
 }
 
-async function withFileMutationQueue(filePath, fn) {
-  // ponytail: resolved paths only; use realpath if symlink aliases become a real concurrency issue.
-  const key = resolve(filePath);
-  const previous = fileMutationQueues.get(key) ?? Promise.resolve();
-  const current = previous.catch(() => {}).then(fn);
-  fileMutationQueues.set(key, current);
-  try {
-    return await current;
-  } finally {
-    if (fileMutationQueues.get(key) === current) fileMutationQueues.delete(key);
-  }
-}
-
 function sanitizeSecrets(value) {
   return String(value)
     .replace(/([?&][^=\s&]+)=([^&\s]+)/g, "$1=***")
@@ -132,8 +72,37 @@ function stripAtPrefix(pathLike) {
   return typeof pathLike === "string" && pathLike.startsWith("@") ? pathLike.slice(1) : pathLike;
 }
 
-function cloneJson(value) {
-  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+function stringRecord(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).map(([key, val]) => [key, String(val)]));
+}
+
+function timeoutMs(milliseconds, seconds, fallbackSeconds) {
+  const value = Number(milliseconds ?? (seconds === undefined ? undefined : Number(seconds) * 1000));
+  return Number.isFinite(value) && value > 0 ? value : fallbackSeconds * 1000;
+}
+
+function resolveHttpHeaders(raw) {
+  const headers = new Headers(stringRecord(raw.http_headers));
+  for (const [header, envName] of Object.entries(stringRecord(raw.env_http_headers))) {
+    const value = process.env[envName];
+    if (value !== undefined) headers.set(header, value);
+  }
+
+  const bearer = typeof raw.bearer_token_env_var === "string" ? process.env[raw.bearer_token_env_var] : undefined;
+  if (bearer && !headers.has("authorization")) headers.set("authorization", `Bearer ${bearer}`);
+  return Object.fromEntries(headers);
+}
+
+function resolveStdioEnv(raw) {
+  const env = stringRecord(raw.env);
+  for (const item of Array.isArray(raw.env_vars) ? raw.env_vars : []) {
+    const name = typeof item === "string" ? item : item?.source !== "remote" ? item?.name : undefined;
+    if (typeof name === "string" && process.env[name] !== undefined && env[name] === undefined) {
+      env[name] = process.env[name];
+    }
+  }
+  return Object.keys(env).length ? env : undefined;
 }
 
 async function loadConfiguredServers() {
@@ -149,23 +118,31 @@ async function loadConfiguredServers() {
     const raw = configured?.[serverName];
     if (!raw || raw.enabled === false) continue;
 
+    const common = {
+      startupTimeoutMs: timeoutMs(raw.startup_timeout_ms, raw.startup_timeout_sec, 10),
+      toolTimeoutMs: timeoutMs(undefined, raw.tool_timeout_sec, 60),
+      enabledTools: Array.isArray(raw.enabled_tools) ? new Set(raw.enabled_tools.map(String)) : undefined,
+      disabledTools: new Set(Array.isArray(raw.disabled_tools) ? raw.disabled_tools.map(String) : []),
+    };
+
     if (typeof raw.url === "string" && raw.url) {
       servers.set(serverName, {
+        ...common,
         type: "remote",
         url: raw.url,
+        headers: resolveHttpHeaders(raw),
       });
       continue;
     }
 
     if (typeof raw.command === "string" && raw.command) {
       servers.set(serverName, {
+        ...common,
         type: "stdio",
         command: raw.command,
         args: Array.isArray(raw.args) ? raw.args.map((arg) => String(arg)) : [],
-        env:
-          raw.env && typeof raw.env === "object"
-            ? Object.fromEntries(Object.entries(raw.env).map(([key, val]) => [key, String(val)]))
-            : undefined,
+        env: resolveStdioEnv(raw),
+        cwd: typeof raw.cwd === "string" ? raw.cwd : undefined,
       });
     }
   }
@@ -180,8 +157,8 @@ function getOrCreateServerState(serverName) {
       status: "disconnected",
       lastError: undefined,
       client: undefined,
-      transport: undefined,
       cwd: undefined,
+      protocol: undefined,
       toolNames: [],
       config: undefined,
       connecting: undefined,
@@ -193,14 +170,14 @@ function getOrCreateServerState(serverName) {
 
 async function closeServer(serverName) {
   const state = getOrCreateServerState(serverName);
-  const transport = state.transport;
+  const client = state.client;
   state.client = undefined;
-  state.transport = undefined;
   state.cwd = undefined;
+  state.protocol = undefined;
   state.status = "disconnected";
-  if (transport?.close) {
+  if (client) {
     try {
-      await transport.close();
+      await client.close();
     } catch {
       // Ignore shutdown errors.
     }
@@ -211,42 +188,26 @@ async function closeAllServers() {
   await Promise.all(Array.from(serverStates.keys()).map((serverName) => closeServer(serverName)));
 }
 
-async function connectRemoteServer(url) {
-  const httpClient = new Client(CLIENT_INFO);
-  const baseUrl = new URL(url);
-  const httpTransport = new StreamableHTTPClientTransport(baseUrl);
+function createClient() {
+  return new Client(CLIENT_INFO, { versionNegotiation: { mode: "auto" } });
+}
 
+async function connectRemoteServer(config) {
+  const client = createClient();
+  const transport = new StreamableHTTPClientTransport(new URL(config.url), {
+    requestInit: { headers: config.headers },
+  });
   try {
-    await httpClient.connect(httpTransport);
-    return { client: httpClient, transport: httpTransport };
-  } catch (httpError) {
-    await httpTransport.close().catch(() => {});
-    const sseClient = new Client(CLIENT_INFO);
-    const transport = new SSEClientTransport(baseUrl);
-    try {
-      await sseClient.connect(transport);
-      return { client: sseClient, transport };
-    } catch (sseError) {
-      await transport.close().catch(() => {});
-      throw new Error(
-        `Streamable HTTP failed (${sanitizeSecrets(httpError?.message || httpError)}); SSE failed (${sanitizeSecrets(
-          sseError?.message || sseError,
-        )})`,
-      );
-    }
+    await client.connect(transport, { timeout: config.startupTimeoutMs });
+    return client;
+  } catch (error) {
+    await client.close().catch(() => {});
+    throw error;
   }
 }
 
-function getMorphSpawnArgs(config, cwd) {
-  const args = [...(config.args || [])];
-  if (cwd && !args.includes(cwd)) {
-    args.push(cwd);
-  }
-  return args;
-}
-
-async function ensureConnected(serverName, cwd, forceReconnect = false) {
-  const servers = await loadConfiguredServers();
+async function ensureConnected(serverName, cwd, forceReconnect = false, configuredServers) {
+  const servers = configuredServers || (await loadConfiguredServers());
   const config = servers.get(serverName);
   if (!config) {
     throw new Error(`Server ${serverName} is not configured in ${CONFIG_PATH}`);
@@ -259,7 +220,6 @@ async function ensureConnected(serverName, cwd, forceReconnect = false) {
     forceReconnect ||
     state.status !== "connected" ||
     !state.client ||
-    !state.transport ||
     (serverName === "morph-mcp" && state.cwd !== cwd);
 
   if (!needsReconnect) {
@@ -274,40 +234,44 @@ async function ensureConnected(serverName, cwd, forceReconnect = false) {
   const connecting = (async () => {
     await closeServer(serverName);
 
-    let connection;
+    let client;
     if (config.type === "remote") {
-      connection = await connectRemoteServer(config.url);
+      client = await connectRemoteServer(config);
     } else {
-      const client = new Client(CLIENT_INFO);
+      client = createClient();
       const transport = new StdioClientTransport({
         command: config.command,
-        args: getMorphSpawnArgs(config, cwd),
+        args: config.args,
         env: config.env,
-        cwd,
+        cwd: serverName === "morph-mcp" ? cwd : config.cwd || cwd,
         stderr: "pipe",
       });
-      await client.connect(transport);
-      connection = { client, transport };
+      try {
+        await client.connect(transport, { timeout: config.startupTimeoutMs });
+      } catch (error) {
+        await client.close().catch(() => {});
+        throw error;
+      }
     }
 
-    connection.client.onerror = (error) => {
+    client.onerror = (error) => {
       const currentState = getOrCreateServerState(serverName);
-      if (currentState.client !== connection.client) return;
+      if (currentState.client !== client) return;
       currentState.status = "error";
       currentState.lastError = sanitizeSecrets(error?.message || error);
     };
-    connection.client.onclose = () => {
+    client.onclose = () => {
       const currentState = getOrCreateServerState(serverName);
-      if (currentState.client !== connection.client) return;
+      if (currentState.client !== client) return;
       currentState.client = undefined;
-      currentState.transport = undefined;
       currentState.cwd = undefined;
+      currentState.protocol = undefined;
       currentState.status = currentState.lastError ? "error" : "disconnected";
     };
 
-    state.client = connection.client;
-    state.transport = connection.transport;
+    state.client = client;
     state.cwd = cwd;
+    state.protocol = client.getNegotiatedProtocolVersion();
     state.status = "connected";
     state.lastError = undefined;
     return state;
@@ -321,21 +285,8 @@ async function ensureConnected(serverName, cwd, forceReconnect = false) {
   }
 }
 
-async function listAllTools(client) {
-  const tools = [];
-  let cursor;
-
-  do {
-    const result = await client.listTools(cursor ? { cursor } : undefined);
-    tools.push(...result.tools);
-    cursor = result.nextCursor;
-  } while (cursor);
-
-  return tools;
-}
-
 function adaptInputSchema(piToolName, inputSchema) {
-  const schema = cloneJson(inputSchema) || { type: "object", additionalProperties: true };
+  const schema = structuredClone(inputSchema || { type: "object", additionalProperties: true });
 
   if (piToolName === "mcp__morph_mcp__codebase_search") {
     if (Array.isArray(schema.required)) {
@@ -347,21 +298,6 @@ function adaptInputSchema(piToolName, inputSchema) {
   }
 
   return schema;
-}
-
-function normalizePreparedArguments(args) {
-  if (!args || typeof args !== "object" || Array.isArray(args)) {
-    return args;
-  }
-
-  const prepared = { ...args };
-  if (typeof prepared.path === "string") {
-    prepared.path = stripAtPrefix(prepared.path);
-  }
-  if (typeof prepared.repo_path === "string") {
-    prepared.repo_path = stripAtPrefix(prepared.repo_path);
-  }
-  return prepared;
 }
 
 function finalizeCallArguments(piToolName, params, ctx) {
@@ -382,25 +318,23 @@ function finalizeCallArguments(piToolName, params, ctx) {
   return args;
 }
 
-function stringifyContentItem(item) {
-  if (!item || typeof item !== "object") {
-    return String(item ?? "");
+function resultToPiParts(result) {
+  const texts = [];
+  const images = [];
+  for (const item of Array.isArray(result?.content) ? result.content : []) {
+    if (item?.type === "text" && typeof item.text === "string") {
+      texts.push(item.text);
+    } else if (item?.type === "image" && typeof item.data === "string" && typeof item.mimeType === "string") {
+      images.push({ type: "image", data: item.data, mimeType: item.mimeType });
+    } else {
+      texts.push(JSON.stringify(item, null, 2));
+    }
   }
-  if (item.type === "text" && typeof item.text === "string") {
-    return item.text;
+  if (!texts.length && result?.structuredContent !== undefined) {
+    texts.push(JSON.stringify(result.structuredContent, null, 2));
   }
-  return JSON.stringify(item, null, 2);
-}
-
-function resultToText(result) {
-  const parts = Array.isArray(result?.content) ? result.content.map((item) => stringifyContentItem(item)).filter(Boolean) : [];
-  if (parts.length > 0) {
-    return parts.join("\n\n");
-  }
-  if (result?.structuredContent !== undefined) {
-    return JSON.stringify(result.structuredContent, null, 2);
-  }
-  return "(no text content returned)";
+  if (!texts.length && !images.length) texts.push("(no content returned)");
+  return { text: texts.filter(Boolean).join("\n\n"), images };
 }
 
 async function truncateForPi(toolName, text) {
@@ -415,7 +349,7 @@ async function truncateForPi(toolName, text) {
 
   const tempFile = join(tmpdir(), `${toolName.replace(/[^a-zA-Z0-9_]+/g, "_")}-${randomUUID()}.txt`);
   await mkdir(dirname(tempFile), { recursive: true });
-  await writeFile(tempFile, text, "utf8");
+  await writeFile(tempFile, text, { encoding: "utf8", mode: 0o600 });
 
   let truncatedText = truncation.content;
   truncatedText += `\n\n[Output truncated: ${truncation.outputLines} of ${truncation.totalLines} lines`;
@@ -442,24 +376,28 @@ function buildStatusMessage() {
     const state = serverStates.get(serverName);
     const label = shortServerName(serverName);
     if (!state) return `${label}: not configured`;
-    if (state.status === "connected") return `${label}: connected (${state.toolNames.length} tools)`;
+    if (state.status === "unconfigured") return `${label}: not configured`;
+    if (state.status === "connected") {
+      return `${label}: connected (${state.toolNames.length} tools, MCP ${state.protocol || "unknown"})`;
+    }
     if (state.lastError) return `${label}: error (${state.lastError})`;
     return `${label}: disconnected`;
   });
   return `MCP bridge — ${parts.join("; ")}`;
 }
 
-function metadataFor(piToolName) {
-  return TOOL_METADATA[piToolName] || {};
-}
-
 function labelFor(serverName, mcpToolName) {
   return `${shortServerName(serverName)}/${mcpToolName}`;
 }
 
+function promptSnippetFor(serverName, tool) {
+  const summary = tool.title || tool.description?.split(/\r?\n/).find((line) => line.trim()) || "MCP tool";
+  return `${labelFor(serverName, tool.name)} — ${summary.replace(/\s+/g, " ").slice(0, 160)}`;
+}
+
 function descriptionFor(serverName, tool) {
   const base = tool.description || `${tool.name} via ${shortServerName(serverName)} MCP`;
-  if (tool.name === "codebase_search") {
+  if (serverName === "morph-mcp" && tool.name === "codebase_search") {
     return `${base} Defaults repo_path to the current working directory when omitted.`;
   }
   return base;
@@ -467,85 +405,64 @@ function descriptionFor(serverName, tool) {
 
 function registerDiscoveredTool(pi, serverName, tool) {
   const piToolName = toPiToolName(serverName, tool.name);
-  if (registeredTools.has(piToolName)) {
-    return piToolName;
-  }
-
   const schema = adaptInputSchema(piToolName, tool.inputSchema);
-  const meta = metadataFor(piToolName);
 
   pi.registerTool({
     name: piToolName,
     label: labelFor(serverName, tool.name),
     description: descriptionFor(serverName, tool),
-    promptSnippet: meta.promptSnippet,
-    promptGuidelines: meta.promptGuidelines,
+    promptSnippet: promptSnippetFor(serverName, tool),
     parameters: schema,
-    prepareArguments: normalizePreparedArguments,
+    executionMode: tool.annotations?.destructiveHint === true ? "sequential" : undefined,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const run = async () => {
-        const state = await ensureConnected(serverName, ctx.cwd);
-        const args = finalizeCallArguments(piToolName, params, ctx);
+      const state = await ensureConnected(serverName, ctx.cwd);
+      const args = finalizeCallArguments(piToolName, params, ctx);
 
-        onUpdate?.({
-          content: [{ type: "text", text: `Calling ${labelFor(serverName, tool.name)}...` }],
-          details: { server: serverName, tool: tool.name, stage: "calling" },
-        });
+      onUpdate?.({
+        content: [{ type: "text", text: `Calling ${labelFor(serverName, tool.name)}...` }],
+        details: { server: serverName, tool: tool.name, stage: "calling" },
+      });
 
-        let result;
-        try {
-          result = await state.client.callTool(
-            {
-              name: tool.name,
-              arguments: args,
-            },
-            undefined,
-            {
-              signal,
-              timeout: 120000,
-            },
-          );
-        } catch (error) {
-          state.status = "error";
-          state.lastError = sanitizeSecrets(error?.message || error);
-          throw new Error(`${labelFor(serverName, tool.name)} failed: ${state.lastError}`);
-        }
-
-        const rawText = resultToText(result);
-        const truncated = await truncateForPi(piToolName, rawText);
-        if (result.isError) {
-          throw new Error(sanitizeSecrets(truncated.text || `${labelFor(serverName, tool.name)} failed`));
-        }
-
-        return {
-          content: [{ type: "text", text: truncated.text }],
-          details: {
-            server: serverName,
-            tool: tool.name,
-            rawContent: result.content,
-            structuredContent: result.structuredContent,
-            tempFile: truncated.tempFile,
-            truncation: truncated.truncation,
-          },
-        };
-      };
-
-      if (
-        piToolName === "mcp__morph_mcp__edit_file" &&
-        typeof params?.path === "string" &&
-        params.path &&
-        !params.dryRun
-      ) {
-        const absolutePath = resolve(ctx.cwd, stripAtPrefix(params.path));
-        return withFileMutationQueue(absolutePath, run);
+      let result;
+      try {
+        result = await state.client.callTool(
+          { name: tool.name, arguments: args },
+          { signal, timeout: state.config.toolTimeoutMs },
+        );
+      } catch (error) {
+        state.status = "error";
+        state.lastError = sanitizeSecrets(error?.message || error);
+        throw new Error(`${labelFor(serverName, tool.name)} failed: ${state.lastError}`);
       }
 
-      return run();
+      const parts = resultToPiParts(result);
+      const truncated = await truncateForPi(piToolName, parts.text);
+      if (result.isError) {
+        throw new Error(sanitizeSecrets(truncated.text || `${labelFor(serverName, tool.name)} failed`));
+      }
+
+      return {
+        content: [...(truncated.text ? [{ type: "text", text: truncated.text }] : []), ...parts.images],
+        details: {
+          server: serverName,
+          tool: tool.name,
+          protocol: state.protocol,
+          rawContent: result.content,
+          structuredContent: result.structuredContent,
+          tempFile: truncated.tempFile,
+          truncation: truncated.truncation,
+        },
+      };
     },
   });
 
-  registeredTools.add(piToolName);
   return piToolName;
+}
+
+function filterConfiguredTools(config, tools) {
+  return tools.filter(
+    (tool) => (!config.enabledTools || config.enabledTools.has(tool.name)) && !config.disabledTools.has(tool.name),
+  );
 }
 
 async function connectAndRegisterTools(pi, ctx, forceReconnect = false) {
@@ -555,8 +472,17 @@ async function connectAndRegisterTools(pi, ctx, forceReconnect = false) {
     const state = getOrCreateServerState(serverName);
 
     try {
-      const connectedState = await ensureConnected(serverName, ctx.cwd, forceReconnect);
-      const tools = await listAllTools(connectedState.client);
+      const configuredServers = await loadConfiguredServers();
+      if (!configuredServers.has(serverName)) {
+        await closeServer(serverName);
+        state.status = "unconfigured";
+        state.lastError = undefined;
+        state.toolNames = [];
+        continue;
+      }
+      const connectedState = await ensureConnected(serverName, ctx.cwd, forceReconnect, configuredServers);
+      const listed = await connectedState.client.listTools();
+      const tools = filterConfiguredTools(connectedState.config, listed.tools);
       connectedState.toolNames = tools.map((tool) => registerDiscoveredTool(pi, serverName, tool));
       connectedState.status = "connected";
       connectedState.lastError = undefined;

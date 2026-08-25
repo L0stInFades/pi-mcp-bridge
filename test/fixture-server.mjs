@@ -19,6 +19,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         additionalProperties: false,
       },
     },
+    {
+      name: "hidden",
+      description: "Filtered test tool",
+      inputSchema: { type: "object" },
+    },
   ],
 }));
 
