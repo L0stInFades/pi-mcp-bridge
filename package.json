@@ -1,0 +1,44 @@
+{
+  "name": "@l0stinfades/pi-mcp-bridge",
+  "version": "0.1.0",
+  "description": "Bridge selected Codex MCP servers into Pi as native tools.",
+  "type": "module",
+  "main": "./src/index.js",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --check src/index.js && node --test test/index.test.js"
+  },
+  "keywords": [
+    "pi",
+    "mcp",
+    "codex",
+    "model-context-protocol"
+  ],
+  "author": "L0stInFades",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/L0stInFades/pi-mcp-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/L0stInFades/pi-mcp-bridge/issues"
+  },
+  "homepage": "https://github.com/L0stInFades/pi-mcp-bridge#readme",
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "smol-toml": "^1.8.0",
+    "zod": "^4.4.3"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.js"
+    ]
+  }
+}
